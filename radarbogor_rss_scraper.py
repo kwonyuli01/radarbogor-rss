@@ -2,13 +2,13 @@
 """
 RadarBogor JawaPos RSS Feed Scraper - Kategori Bansos
 ======================================================
-Scrape halaman kategori bansos dari radarbogor.jawapos.com
-dengan konten artikel lengkap (termasuk multi-page hingga 5 halaman).
+Menggunakan Playwright (headless browser) untuk bypass Cloudflare.
+Scrape halaman kategori bansos + konten artikel lengkap (multi-page 1-5).
 
 Dijalankan otomatis via GitHub Actions + publish ke GitHub Pages.
 """
 
-import requests
+from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
 import time
@@ -24,27 +24,17 @@ import hashlib
 BASE_URL = "https://radarbogor.jawapos.com"
 CATEGORY_URL = "https://radarbogor.jawapos.com/bansos"
 
-# Jumlah artikel maksimal
 MAX_ARTICLES = 20
 
-# Nama dan deskripsi feed
 FEED_TITLE = "Radar Bogor - Bansos"
 FEED_DESCRIPTION = "RSS Feed kategori Bansos dari radarbogor.jawapos.com dengan konten artikel lengkap"
 FEED_LINK = "https://radarbogor.jawapos.com/bansos"
 
-# File output
 OUTPUT_FILE = "docs/feed.xml"
+REQUEST_DELAY = 3
 
-# Delay antar request (detik)
-REQUEST_DELAY = 2
-
-# User Agent
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-# Timezone WIB
 WIB = timezone(timedelta(hours=7))
 
-# Bulan Indonesia ke angka
 BULAN_MAP = {
     'januari': 1, 'februari': 2, 'maret': 3, 'april': 4,
     'mei': 5, 'juni': 6, 'juli': 7, 'agustus': 8,
@@ -52,31 +42,124 @@ BULAN_MAP = {
 }
 
 # ============================================================
-# KODE UTAMA
+# BROWSER SETUP
 # ============================================================
 
-session = requests.Session()
-session.headers.update({
-    "User-Agent": USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
-})
+browser = None
+context = None
+page = None
+
+
+def init_browser():
+    """Inisialisasi Playwright browser dengan stealth settings."""
+    global browser, context, page
+
+    pw = sync_playwright().start()
+
+    browser = pw.chromium.launch(
+        headless=True,
+        args=[
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-blink-features=AutomationControlled',
+            '--disable-dev-shm-usage',
+        ]
+    )
+
+    context = browser.new_context(
+        viewport={'width': 1920, 'height': 1080},
+        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        locale='id-ID',
+        timezone_id='Asia/Jakarta',
+        extra_http_headers={
+            'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
+        }
+    )
+
+    # Hapus navigator.webdriver flag
+    context.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'languages', { get: () => ['id-ID', 'id', 'en-US', 'en'] });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        window.chrome = { runtime: {} };
+    """)
+
+    page = context.new_page()
+    print("[*] Browser Playwright berhasil diinisialisasi")
+    return pw
 
 
 def fetch_page(url, retries=3):
-    """Fetch halaman web dengan retry."""
+    """Fetch halaman menggunakan Playwright browser."""
     for attempt in range(retries):
         try:
-            response = session.get(url, timeout=30)
-            response.raise_for_status()
-            response.encoding = 'utf-8'
-            return response.text
-        except requests.RequestException as e:
-            print(f"  [!] Gagal fetch {url} (percobaan {attempt+1}/{retries}): {e}")
+            print(f"  [>] Fetching: {url}")
+            response = page.goto(url, wait_until='domcontentloaded', timeout=30000)
+
+            if response is None:
+                print(f"  [!] Response None (percobaan {attempt+1}/{retries})")
+                time.sleep(REQUEST_DELAY * 2)
+                continue
+
+            status = response.status
+            print(f"  [>] Status: {status}")
+
+            # Jika Cloudflare challenge, tunggu redirect
+            if status == 403 or status == 503:
+                print(f"  [~] Cloudflare challenge terdeteksi, menunggu...")
+                try:
+                    page.wait_for_load_state('networkidle', timeout=15000)
+                    time.sleep(5)
+                    content = page.content()
+                    if 'Checking your browser' in content or 'cf-browser-verification' in content:
+                        print(f"  [~] Masih di Cloudflare, tunggu lagi...")
+                        time.sleep(5)
+                        content = page.content()
+                except Exception:
+                    pass
+
+                content = page.content()
+                if len(content) > 5000:
+                    print(f"  [+] Berhasil melewati Cloudflare ({len(content)} chars)")
+                    return content
+                else:
+                    print(f"  [!] Gagal bypass Cloudflare (percobaan {attempt+1}/{retries})")
+                    time.sleep(REQUEST_DELAY * 2)
+                    continue
+
+            if status == 200:
+                page.wait_for_load_state('networkidle', timeout=15000)
+                time.sleep(1)
+                content = page.content()
+                print(f"  [+] Berhasil ({len(content)} chars)")
+                return content
+
+            print(f"  [!] Status {status} (percobaan {attempt+1}/{retries})")
+            time.sleep(REQUEST_DELAY * 2)
+
+        except Exception as e:
+            print(f"  [!] Error: {e} (percobaan {attempt+1}/{retries})")
             if attempt < retries - 1:
                 time.sleep(REQUEST_DELAY * 2)
+
     return None
 
+
+def close_browser():
+    """Tutup browser."""
+    global browser, context
+    try:
+        if context:
+            context.close()
+        if browser:
+            browser.close()
+    except Exception:
+        pass
+
+
+# ============================================================
+# PARSING FUNCTIONS
+# ============================================================
 
 def parse_list_page(url):
     """Parse halaman kategori untuk mendapatkan daftar artikel."""
@@ -88,7 +171,7 @@ def parse_list_page(url):
     soup = BeautifulSoup(html_content, 'lxml')
     articles = []
 
-    # 1. Ambil headline article (h1.hl__b-title > a)
+    # 1. Headline (h1.hl__b-title > a)
     headline = soup.select_one('h1.hl__b-title a.hl__link')
     if headline:
         href = headline.get('href', '')
@@ -98,7 +181,7 @@ def parse_list_page(url):
                 href = BASE_URL + href
             articles.append({'title': title, 'link': href})
 
-    # 2. Ambil semua latest articles (div.latest__item)
+    # 2. Latest items (div.latest__item)
     for item in soup.select('div.latest__item'):
         link_tag = item.select_one('a.latest__link')
         if not link_tag:
@@ -113,7 +196,6 @@ def parse_list_page(url):
         if not href.startswith('http'):
             href = BASE_URL + href
 
-        # Hindari duplikat
         if any(a['link'] == href for a in articles):
             continue
 
@@ -137,28 +219,23 @@ def parse_article_page(url):
     soup = BeautifulSoup(html_content, 'lxml')
     article_data = {}
 
-    # === JUDUL ===
+    # JUDUL
     h1 = soup.select_one('h1.read__title')
     article_data['title'] = h1.get_text(strip=True) if h1 else ''
 
-    # === TANGGAL ===
-    # Prioritas 1: dataLayer published_date "2026-02-24 08:50:51"
+    # TANGGAL (dataLayer)
     pub_date_str = ''
     match = re.search(r'"published_date"\s*:\s*"([^"]+)"', html_content)
     if match:
         pub_date_str = match.group(1)
-
-    # Prioritas 2: div.read__info__date "- Selasa, 24 Februari 2026 | 08:50 WIB"
     if not pub_date_str:
         date_div = soup.select_one('div.read__info__date')
         if date_div:
             pub_date_str = date_div.get_text(strip=True)
-
     article_data['pub_date'] = parse_date(pub_date_str)
 
-    # === REPORTER ===
+    # REPORTER
     reporter = ''
-    # dataLayer penulis
     match = re.search(r'"penulis"\s*:\s*"([^"]+)"', html_content)
     if match:
         reporter = match.group(1)
@@ -168,46 +245,42 @@ def parse_article_page(url):
             reporter = author_div.get_text(strip=True)
     article_data['reporter'] = reporter
 
-    # === EDITOR ===
+    # EDITOR
     editor = ''
     match = re.search(r'"editor"\s*:\s*"([^"]+)"', html_content)
     if match:
         editor = match.group(1)
     article_data['editor'] = editor
 
-    # === GAMBAR UTAMA ===
+    # GAMBAR
     main_image = ''
     og_image = soup.find('meta', property='og:image')
     if og_image:
         main_image = og_image.get('content', '')
-
     if not main_image:
-        # Fallback: lazyload image di photo div
         photo_img = soup.select_one('div.photo__img img')
         if photo_img:
             main_image = photo_img.get('data-src', '') or photo_img.get('src', '')
-
     article_data['image'] = main_image
 
-    # === CAPTION ===
+    # CAPTION
     caption = ''
     caption_div = soup.select_one('div.photo__caption')
     if caption_div:
         caption = caption_div.get_text(strip=True)
     article_data['caption'] = caption
 
-    # === KONTEN ARTIKEL (halaman 1) ===
+    # KONTEN (halaman 1)
     content_parts = extract_content(soup)
     article_data['content'] = '\n\n'.join(content_parts)
 
-    # === MULTI-PAGE: Halaman 2-5 ===
+    # MULTI-PAGE (halaman 2-5)
     paging = soup.select_one('div.paging.paging--article')
     if paging:
         page_links = []
         for a in paging.select('a.paging__link'):
             href = a.get('href', '')
             text = a.get_text(strip=True)
-            # Skip halaman aktif, "Selanjutnya", dan duplikat
             if 'paging__link--active' in a.get('class', []):
                 continue
             if text.lower() in ['selanjutnya', 'sebelumnya', 'next', 'prev']:
@@ -215,7 +288,7 @@ def parse_article_page(url):
             if href and href not in page_links:
                 page_links.append(href)
 
-        for page_url in page_links[:4]:  # Maks 4 halaman tambahan (total 5)
+        for page_url in page_links[:4]:
             if not page_url.startswith('http'):
                 page_url = BASE_URL + page_url
             print(f"    [>] Halaman lanjutan: {page_url}")
@@ -224,16 +297,15 @@ def parse_article_page(url):
             if page_content:
                 article_data['content'] += '\n\n' + page_content
 
-    # === TAGS ===
+    # TAGS
     tags = []
-    tag_list = soup.select('ul.tag__list li h4 a')
-    for tag_link in tag_list:
+    for tag_link in soup.select('ul.tag__list li h4 a'):
         tag_text = tag_link.get_text(strip=True)
         if tag_text and tag_text not in tags:
             tags.append(tag_text)
     article_data['tags'] = tags
 
-    # === KATEGORI ===
+    # KATEGORI
     category = ''
     match = re.search(r'"rubrik"\s*:\s*"([^"]+)"', html_content)
     if match:
@@ -244,7 +316,7 @@ def parse_article_page(url):
 
 
 def extract_content(soup):
-    """Ekstrak konten artikel dari article.read__content."""
+    """Ekstrak konten dari article.read__content."""
     content_parts = []
 
     article_elem = soup.select_one('article.read__content')
@@ -252,28 +324,16 @@ def extract_content(soup):
         return content_parts
 
     for elem in article_elem.find_all(['p', 'h2', 'h3', 'h4']):
-        # Skip "Baca Juga" links
-        baca_juga = elem.find('strong', class_='read__others')
-        if baca_juga:
+        if elem.find('strong', class_='read__others'):
             continue
 
         text = elem.get_text(strip=True)
-
-        if not text:
-            continue
-
-        # Skip komentar HTML dan placeholder
-        if text.startswith('<!--') or text == '':
-            continue
-
-        # Skip teks sangat pendek
-        if len(text) < 5:
+        if not text or len(text) < 5:
             continue
 
         if elem.name in ['h2', 'h3', 'h4']:
             content_parts.append(f"\n### {text}\n")
         else:
-            # Cek apakah paragraf berisi sub-judul (bold saja)
             strong = elem.find('strong')
             if strong and strong.get_text(strip=True) == text and not elem.find('a'):
                 content_parts.append(f"\n### {text}\n")
@@ -286,7 +346,7 @@ def extract_content(soup):
 
 
 def fetch_additional_page(url):
-    """Fetch halaman lanjutan dari artikel multi-page."""
+    """Fetch halaman lanjutan artikel multi-page."""
     html_content = fetch_page(url)
     if not html_content:
         return ''
@@ -295,6 +355,10 @@ def fetch_additional_page(url):
     content_parts = extract_content(soup)
     return '\n\n'.join(content_parts)
 
+
+# ============================================================
+# DATE PARSING
+# ============================================================
 
 def parse_date(date_str):
     """Parse tanggal ke format RFC 822."""
@@ -305,7 +369,7 @@ def parse_date(date_str):
     months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
               'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
-    # Format 1: "2026-02-24 08:50:51" (dataLayer)
+    # "2026-02-24 08:50:51"
     m = re.search(r'(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})', date_str)
     if m:
         year, month, day, hour, minute, sec = m.groups()
@@ -315,7 +379,7 @@ def parse_date(date_str):
         except ValueError:
             pass
 
-    # Format 2: "Selasa, 24 Februari 2026 | 08:50 WIB"
+    # "Selasa, 24 Februari 2026 | 08:50 WIB"
     m = re.search(r'(\d{1,2})\s+(\w+)\s+(\d{4})\s*\|\s*(\d{2}):(\d{2})', date_str)
     if m:
         day, bulan_str, year, hour, minute = m.groups()
@@ -330,8 +394,12 @@ def parse_date(date_str):
     return datetime.now(WIB).strftime('%a, %d %b %Y %H:%M:%S +0700')
 
 
+# ============================================================
+# RSS GENERATION
+# ============================================================
+
 def generate_rss(articles_data):
-    """Generate file RSS XML dari data artikel."""
+    """Generate file RSS XML."""
     print(f"\n[*] Generating RSS XML...")
     now = datetime.now(WIB).strftime('%a, %d %b %Y %H:%M:%S +0700')
 
@@ -342,25 +410,17 @@ def generate_rss(articles_data):
 
         content_html = ''
 
-        # Gambar utama
         if article.get('image'):
             content_html += f'<p><img src="{html.escape(article["image"])}" alt="{html.escape(article.get("title", ""))}" style="max-width:100%;" /></p>\n'
-
-        # Caption
         if article.get('caption'):
             content_html += f'<p><em>{html.escape(article["caption"])}</em></p>\n'
-
-        # Reporter/Editor
         if article.get('reporter'):
             content_html += f'<p><strong>Reporter:</strong> {html.escape(article["reporter"])}'
             if article.get('editor'):
                 content_html += f' | <strong>Editor:</strong> {html.escape(article["editor"])}'
             content_html += '</p>\n'
-
-        # Konten
         if article.get('content'):
-            paragraphs = article['content'].split('\n\n')
-            for para in paragraphs:
+            for para in article['content'].split('\n\n'):
                 para = para.strip()
                 if not para:
                     continue
@@ -368,8 +428,6 @@ def generate_rss(articles_data):
                     content_html += f'<h3>{html.escape(para[4:])}</h3>\n'
                 else:
                     content_html += f'<p>{html.escape(para)}</p>\n'
-
-        # Tags
         if article.get('tags'):
             tags_str = ', '.join(article['tags'])
             content_html += f'<p><strong>Tags:</strong> {html.escape(tags_str)}</p>\n'
@@ -399,7 +457,7 @@ def generate_rss(articles_data):
     <link>{html.escape(FEED_LINK)}</link>
     <language>id</language>
     <lastBuildDate>{now}</lastBuildDate>
-    <generator>RadarBogor RSS Scraper (GitHub Actions)</generator>
+    <generator>RadarBogor RSS Scraper - Playwright (GitHub Actions)</generator>
 '''
 
     for item in rss_items:
@@ -425,10 +483,14 @@ def generate_rss(articles_data):
     return rss_xml
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
     """Fungsi utama."""
     print("=" * 60)
-    print("  RadarBogor JawaPos RSS Scraper - Bansos")
+    print("  RadarBogor JawaPos RSS Scraper - Bansos (Playwright)")
     print("=" * 60)
     print(f"  Feed Title : {FEED_TITLE}")
     print(f"  Output     : {OUTPUT_FILE}")
@@ -438,55 +500,66 @@ def main():
 
     os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
 
-    # Step 1: Scrape halaman kategori
-    articles = parse_list_page(CATEGORY_URL)
+    pw = init_browser()
 
-    if not articles:
-        print("\n[!] Tidak ada artikel ditemukan.")
-        return
+    try:
+        # Step 1: Scrape halaman kategori
+        articles = parse_list_page(CATEGORY_URL)
 
-    # Hapus duplikat
-    seen = set()
-    unique_articles = []
-    for article in articles:
-        if article['link'] not in seen:
-            seen.add(article['link'])
-            unique_articles.append(article)
+        if not articles:
+            print("\n[!] Tidak ada artikel ditemukan.")
+            print("[!] Kemungkinan Cloudflare masih memblokir.")
+            return
 
-    print(f"\n[*] Total {len(unique_articles)} artikel unik")
+        # Hapus duplikat
+        seen = set()
+        unique_articles = []
+        for article in articles:
+            if article['link'] not in seen:
+                seen.add(article['link'])
+                unique_articles.append(article)
 
-    # Step 2: Fetch konten lengkap setiap artikel
-    articles_data = []
-    for i, article in enumerate(unique_articles):
-        print(f"\n--- Artikel {i+1}/{len(unique_articles)} ---")
-        article_data = parse_article_page(article['link'])
+        print(f"\n[*] Total {len(unique_articles)} artikel unik")
 
-        if article_data:
-            if not article_data.get('title'):
-                article_data['title'] = article['title']
-            article_data['link'] = article['link']
-            articles_data.append(article_data)
-        else:
-            articles_data.append({
-                'title': article['title'],
-                'link': article['link'],
-                'content': '(Konten tidak dapat diambil)',
-                'pub_date': datetime.now(WIB).strftime('%a, %d %b %Y %H:%M:%S +0700'),
-                'image': '', 'reporter': '', 'editor': '',
-                'tags': [], 'category': '', 'caption': '',
-            })
+        # Step 2: Fetch konten lengkap
+        articles_data = []
+        for i, article in enumerate(unique_articles):
+            print(f"\n--- Artikel {i+1}/{len(unique_articles)} ---")
+            article_data = parse_article_page(article['link'])
 
-        time.sleep(REQUEST_DELAY)
+            if article_data:
+                if not article_data.get('title'):
+                    article_data['title'] = article['title']
+                article_data['link'] = article['link']
+                articles_data.append(article_data)
+            else:
+                articles_data.append({
+                    'title': article['title'],
+                    'link': article['link'],
+                    'content': '(Konten tidak dapat diambil)',
+                    'pub_date': datetime.now(WIB).strftime('%a, %d %b %Y %H:%M:%S +0700'),
+                    'image': '', 'reporter': '', 'editor': '',
+                    'tags': [], 'category': '', 'caption': '',
+                })
 
-    # Step 3: Generate & simpan RSS
-    rss_xml = generate_rss(articles_data)
-    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-        f.write(rss_xml)
+            time.sleep(REQUEST_DELAY)
 
-    print(f"\n{'=' * 60}")
-    print(f"  SELESAI! File: {OUTPUT_FILE}")
-    print(f"  Total artikel: {len(articles_data)}")
-    print(f"{'=' * 60}")
+        # Step 3: Generate & simpan RSS
+        rss_xml = generate_rss(articles_data)
+        with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+            f.write(rss_xml)
+
+        print(f"\n{'=' * 60}")
+        print(f"  SELESAI! File: {OUTPUT_FILE}")
+        print(f"  Total artikel: {len(articles_data)}")
+        print(f"{'=' * 60}")
+
+    finally:
+        close_browser()
+        try:
+            pw.stop()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':
