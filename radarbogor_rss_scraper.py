@@ -107,17 +107,7 @@ def fetch_page(url, retries=3):
             # Jika Cloudflare challenge, tunggu redirect
             if status == 403 or status == 503:
                 print(f"  [~] Cloudflare challenge terdeteksi, menunggu...")
-                try:
-                    page.wait_for_load_state('networkidle', timeout=15000)
-                    time.sleep(5)
-                    content = page.content()
-                    if 'Checking your browser' in content or 'cf-browser-verification' in content:
-                        print(f"  [~] Masih di Cloudflare, tunggu lagi...")
-                        time.sleep(5)
-                        content = page.content()
-                except Exception:
-                    pass
-
+                time.sleep(8)
                 content = page.content()
                 if len(content) > 5000:
                     print(f"  [+] Berhasil melewati Cloudflare ({len(content)} chars)")
@@ -128,8 +118,9 @@ def fetch_page(url, retries=3):
                     continue
 
             if status == 200:
-                page.wait_for_load_state('networkidle', timeout=15000)
-                time.sleep(1)
+                # Tunggu sebentar untuk DOM stabil, JANGAN pakai networkidle
+                # karena situs ini terus loading ads/tracker
+                time.sleep(2)
                 content = page.content()
                 print(f"  [+] Berhasil ({len(content)} chars)")
                 return content
